@@ -911,6 +911,8 @@ func (fb *filterBackend) GetBody(ctx context.Context, hash common.Hash, number r
 }
 
 func (fb *filterBackend) PendingBlockAndReceipts() (*types.Block, types.Receipts) {
+	fb.backend.mu.Lock()
+	defer fb.backend.mu.Unlock()
 	return fb.backend.pendingBlock, fb.backend.pendingReceipts
 }
 
