@@ -71,6 +71,8 @@ type SimulatedBackend struct {
 	events       *filters.EventSystem  // for filtering log events live
 	filterSystem *filters.FilterSystem // for filtering database logs
 
+	pendingLogsSubs map[chan<- []*types.Log]bool
+
 	config *params.ChainConfig
 }
 
@@ -86,9 +88,10 @@ func NewSimulatedBackendWithDatabase(database ethdb.Database, alloc core.Genesis
 	blockchain, _ := core.NewBlockChain(database, nil, &genesis, nil, ethash.NewFaker(), vm.Config{}, nil, nil)
 
 	backend := &SimulatedBackend{
-		database:   database,
-		blockchain: blockchain,
-		config:     genesis.Config,
+		database:        database,
+		blockchain:      blockchain,
+		config:          genesis.Config,
+		pendingLogsSubs: map[chan<- []*types.Log]bool{},
 	}
 
 	filterBackend := &filterBackend{database, blockchain, backend}
@@ -705,6 +708,9 @@ func (b *SimulatedBackend) SendTransaction(ctx context.Context, tx *types.Transa
 	b.pendingBlock = blocks[0]
 	b.pendingState, _ = state.New(b.pendingBlock.Root(), stateDB.Database(), nil)
 	b.pendingReceipts = receipts[0]
+	for ch := range b.pendingLogsSubs {
+		ch <- receipts[0][len(receipts[0])-1].Logs
+	}
 	return nil
 }
 
@@ -793,6 +799,35 @@ func (b *SimulatedBackend) SubscribeNewHead(ctx context.Context, ch chan<- *type
 					return err
 				case <-quit:
 					return nil
+				}
+			case err := <-sub.Err():
+				return err
+			case <-quit:
+				return nil
+			}
+		}
+	}), nil
+}
+
+// SubscribePendingTxs returns an event subscription for a pending transactions.
+func (b *SimulatedBackend) SubscribePendingTransactions(ctx context.Context, ch chan<- *types.Transaction) (ethereum.Subscription, error) {
+	// subscribe to a new head
+	sink := make(chan []*types.Transaction)
+	sub := b.events.SubscribePendingTxs(sink)
+
+	return event.NewSubscription(func(quit <-chan struct{}) error {
+		defer sub.Unsubscribe()
+		for {
+			select {
+			case txs := <-sink:
+				for _, tx := range txs {
+					select {
+					case ch <- tx:
+					case err := <-sub.Err():
+						return err
+					case <-quit:
+						return nil
+					}
 				}
 			case err := <-sub.Err():
 				return err
@@ -913,7 +948,13 @@ func (fb *filterBackend) SubscribeLogsEvent(ch chan<- []*types.Log) event.Subscr
 }
 
 func (fb *filterBackend) SubscribePendingLogsEvent(ch chan<- []*types.Log) event.Subscription {
-	return nullSubscription()
+	sub := event.NewSubscription(func(quit <-chan struct{}) error {
+		<-quit
+		delete(fb.backend.pendingLogsSubs, ch)
+		return nil
+	})
+	fb.backend.pendingLogsSubs[ch] = true
+	return sub
 }
 
 func (fb *filterBackend) BloomStatus() (uint64, uint64) { return 4096, 0 }
